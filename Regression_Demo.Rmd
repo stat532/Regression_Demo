@@ -1,0 +1,236 @@
+---
+title: "Regression Demo"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(readr)
+library(knitr)
+library(ggplot2)
+library(mnormt)
+library(LearnBayes)
+library(coda)
+library(rjags)
+library(yarrr)
+```
+
+## Data Description
+The data was obtained from [https://www.kaggle.com/fivethirtyeight/the-ultimate-halloween-candy-power-ranking](https://www.kaggle.com/fivethirtyeight/the-ultimate-halloween-candy-power-ranking). The original article and analysis is available at [https://fivethirtyeight.com/features/the-ultimate-halloween-candy-power-ranking/](https://fivethirtyeight.com/features/the-ultimate-halloween-candy-power-ranking/).
+
+```{r}
+candy <- read_csv('http://math.montana.edu/ahoegh/teaching/stat446/candy-data.csv')
+candy <- candy %>% mutate(chocolate_factor = as.factor(chocolate), 
+                          nut_factor = as.factor(peanutyalmondy))
+```
+
+##### Context
+
+What’s the best (or at least the most popular) Halloween candy? That was the question this dataset was collected to answer. Data was collected by creating a website where participants were shown presenting two fun-sized candies and asked to click on the one they would prefer to receive. In total, more than 269 thousand votes were collected from 8,371 different IP addresses.
+
+##### Content
+
+candy-data.csv includes attributes for each candy along with its ranking. For binary variables, 1 means yes, 0 means no. The data contains the following fields:
+
+- chocolate: Does it contain chocolate?
+- fruity: Is it fruit flavored?
+- caramel: Is there caramel in the candy?
+- peanutalmondy: Does it contain peanuts, peanut butter or almonds?
+- nougat: Does it contain nougat?
+- crispedricewafer: Does it contain crisped rice, wafers, or a cookie component?
+- hard: Is it a hard candy?
+- bar: Is it a candy bar?
+- pluribus: Is it one of many candies in a bag or box?
+- sugarpercent: The percentile of sugar it falls under within the data set.
+- pricepercent: The unit price percentile compared to the rest of the set.
+- winpercent: The overall win percentage according to 269,000 matchups.
+
+##### Acknowledgements:
+
+This dataset is Copyright (c) 2014 ESPN Internet Ventures and distributed under an MIT license. Check out the analysis and write-up here: The Ultimate Halloween Candy Power Ranking. Thanks to Walt Hickey for making the data available.
+
+
+## Data Exploration
+
+```{r}
+candy %>% ggplot(aes(x = winpercent)) + geom_histogram() + ggtitle('Distribution for Win Percent') + 
+  xlim(0,100)
+candy %>% ggplot(aes(y = winpercent, x = chocolate_factor)) + geom_violin() + geom_jitter() + 
+  xlab('Chocolate') + ylim(0,100)
+candy %>% ggplot(aes(y = winpercent, x = nut_factor)) + geom_violin() + geom_jitter() + 
+  xlab('Peanut or Almond') + ylim(0,100)
+```
+
+
+## Linear Models Demo
+
+The goal of this analysis will be to model the `winpercent` variables in the dataset. I'll use the `chocolate` and `peanutyalmondy` variables, but you are welcome to try your own covariates.
+
+### Linear Model Framework
+
+###### Sampling Model
+$$\tilde{Y} \sim N(X \tilde{\beta}, \sigma^2 I)$$
+where $\tilde{Y}$ is a vector of length n = `r nrow(candy)` where the $i^{th}$ response is the winpercent of candy $i$,   $$X = \begin{bmatrix}
+  1&chocolate_1& peanutyalmondy_1 \\
+  1&chocolate_2 &peanutyalmondy_2 \\
+  \vdots &  \ddots & \vdots\\
+  1&chocolate_n &peanutyalmondy_n
+  \end{bmatrix}$$
+
+###### Priors
+
+$$\tilde{\beta}\sim N(\tilde{\beta_0}, \Sigma_0)$$
+$$\sigma^2 \sim IG \left(\frac{\nu_0}{2},\frac{\nu_0 \sigma^2_0} {2} \right)$$
+
+
+#### 0. `lm()`
+
+```{r}
+lm_candy <- lm(winpercent ~ chocolate_factor + nut_factor, data = candy)
+summary(lm_candy)
+predict(lm_candy, data.frame(chocolate_factor = as.factor(c(1,1,0,0)), nut_factor = as.factor(c(1,0,1,0))))
+```
+
+- **Interpret the coefficients in this model**
+
+#### 1. Gibbs Sampler
+
+```{r, eval = T}
+set.seed(10262018)
+y <- candy$winpercent
+X <- model.matrix(winpercent ~ chocolate_factor + nut_factor, data = candy)
+p <- ncol(X)
+n <- nrow(X)
+
+# Initialization and Prior
+num_mcmc <- 5000
+beta_0 <- rep(0,p)
+Sigma_0 <- diag(p) * 1000
+Sigma_0_inv <- solve(Sigma_0)
+nu_0 <- .02
+sigmasq_0 <- 1
+beta_samples <- matrix(0, nrow = num_mcmc, ncol = p)
+sigmasq_samples <- rep(1, num_mcmc)
+
+for (iter in 2:num_mcmc){
+  # sample beta
+  cov_beta <- solve(Sigma_0_inv + t(X) %*% X / sigmasq_samples[iter - 1])
+  exp_beta <- cov_beta %*% (Sigma_0_inv %*% beta_0 + t(X) %*% y / sigmasq_samples[iter-1])
+  beta_samples[iter,] <- rmnorm(1, exp_beta, cov_beta) 
+  
+  # sample sigmasq
+  sigmasq_samples[iter] <- rigamma(1, .5 * (nu_0 + n) , 
+          .5 * (nu_0 * sigmasq_0 + t(y - X %*% beta_samples[iter,]) %*% 
+                  (y - X %*% beta_samples[iter,])) )
+}
+
+burn_in <- 100
+beta_samples[(burn_in+1):num_mcmc,] %>% as.mcmc() %>% summary()
+beta_samples[(burn_in+1):num_mcmc,] %>% as.mcmc() %>% HPDinterval()
+beta_samples[(burn_in+1):num_mcmc,] %>% as.mcmc() %>% effectiveSize()
+
+sqrt(sigmasq_samples[(burn_in+1):num_mcmc]) %>% as.mcmc() %>% summary()
+
+tibble(beta0 = beta_samples[(burn_in+1):num_mcmc,1], iteration = 1:(num_mcmc - burn_in)) %>% 
+  ggplot(aes(y = beta0,iteration)) + geom_line()
+
+```
+
+
+#### 2. JAGS
+
+
+###### Model Specification
+```{r}
+model_string <- "model{
+  # Likelihood
+  for(i in 1:n){
+    y[i]   ~ dnorm(mu[i],inv.var)
+    mu[i] <- beta[1] + beta[2]*chocolate[i] + beta[3]*peanut[i]
+  }
+
+  
+  # Note priors are hard-coded, but could be variables
+  
+  # Prior for beta 
+  for(j in 1:3){
+    beta[j] ~ dnorm(0,0.001)
+  }
+
+  # Prior for the inverse variance
+  inv.var   ~ dgamma(0.01, 0.01)
+  sigma     <- 1/sqrt(inv.var)
+
+}"
+```
+
+###### Compile in JAGS
+```{r}
+model <- jags.model(textConnection(model_string), 
+                    data = list(y = candy$winpercent,n = nrow(candy),
+                                chocolate = candy$chocolate,
+                                peanut=candy$peanutyalmondy))
+```
+
+###### Draw Samples
+
+```{r}
+# Burnin for 1000 samples
+update(model, 1000, progress.bar="none") 
+
+samp <- coda.samples(model, 
+        variable.names=c("beta","sigma"), 
+        n.iter=5000, progress.bar="none")
+
+summary(samp)
+#plot(samp)
+```
+
+#### 3. Stan
+
+##### Model Statement
+
+```{stan output.var="lm_stan"}
+data {
+  int<lower=0> N;
+  vector[N] chocolate;
+  vector[N] peanut;
+  vector[N] y;
+}
+parameters {
+  real beta0;
+  real beta1;
+  real beta2;
+  real<lower=0> sigma;
+}
+model {
+  y ~ normal(beta0 + beta1 * chocolate + beta2 * peanut, sigma);
+}
+```
+
+```{r}
+library(rstan)
+post <- rstan::sampling(lm_stan, 
+             data = list(y = candy$winpercent, N = nrow(candy), peanut = candy$peanutyalmondy, chocolate = candy$chocolate))
+post
+```
+
+
+### Posterior Predictive Distribution
+A quote from the Bayesian Data Analysis textbook highlights the goal of model checking.
+>> We do not like to ask: 'Is our model true or false?', since probability models in most data analyses will not be perfectly true... The more relevant question is 'Do the model's deficiencies have a noticeable effect on the substantive inference?'
+
+```{r, warning = F}
+Y <- rep(0, (num_mcmc - burn_in))
+for (i in 1:(num_mcmc - burn_in)){
+  Y[i] <- rnorm(1,  beta_samples[i+burn_in,] %*% X[sample(n,1),], sqrt(sigmasq_samples[i+burn_in]))
+}
+
+tibble(Y = Y) %>% ggplot(aes(x = Y)) + geom_histogram(bins = 100) + ggtitle('Posterior Predictive Distribution') + 
+  xlim(0,100)
+
+candy %>% ggplot(aes(x = winpercent)) + geom_histogram() + ggtitle('Distribution for Win Percent') + 
+  xlim(0,100)
+```
+
